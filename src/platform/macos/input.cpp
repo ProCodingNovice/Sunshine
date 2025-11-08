@@ -3,14 +3,24 @@
  * @brief Definitions for macOS input handling.
  */
 // standard includes
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 
 // platform includes
 #include <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/hid/IOHIDKeys.h>
+#include <IOKit/hid/IOHIDLib.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
+#include <IOKit/hid/IOHIDUserDevice.h>
 #include <mach/mach.h>
 
 // local includes
@@ -29,6 +39,103 @@ constexpr std::chrono::milliseconds MULTICLICK_DELAY_MS(500);
 namespace platf {
   using namespace std::literals;
 
+  namespace {
+    constexpr std::uint8_t HAT_NEUTRAL = 0x0F;
+    constexpr std::size_t GAMEPAD_REPORT_SIZE = 9;
+
+    // HID descriptor for a generic 16-button gamepad with a hat and 6 analog axes.
+    constexpr std::array<std::uint8_t, 74> GAMEPAD_REPORT_DESCRIPTOR = {
+      0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01, 0x35, 0x00, 0x45, 0x01, 0x75, 0x01, 0x95, 0x10, 0x05, 0x09, 0x19, 0x01,
+      0x29, 0x10, 0x81, 0x02, 0x05, 0x01, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x09, 0x39, 0x81,
+      0x42, 0x65, 0x00, 0x75, 0x04, 0x95, 0x01, 0x81, 0x03, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x06, 0x05, 0x01, 0x09, 0x30,
+      0x09, 0x31, 0x09, 0x33, 0x09, 0x34, 0x09, 0x32, 0x09, 0x35, 0x81, 0x02, 0xC0
+    };
+
+    std::array<std::uint8_t, GAMEPAD_REPORT_SIZE> neutral_report() {
+      return {0x00, 0x00, HAT_NEUTRAL, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00};
+    }
+
+    std::uint8_t axis_from_int16(std::int16_t value) {
+      auto normalized = static_cast<int>(value) + 32768;
+      return static_cast<std::uint8_t>(normalized >> 8);
+    }
+
+    std::uint16_t buttons_from_flags(std::uint32_t flags) {
+      std::uint16_t buttons = 0;
+      const auto set_bit = [&](std::uint16_t bit, bool enabled) {
+        if (enabled) {
+          buttons |= static_cast<std::uint16_t>(1u << bit);
+        }
+      };
+
+      set_bit(0, flags & A);
+      set_bit(1, flags & B);
+      set_bit(2, flags & X);
+      set_bit(3, flags & Y);
+      set_bit(4, flags & LEFT_BUTTON);
+      set_bit(5, flags & RIGHT_BUTTON);
+      set_bit(6, flags & BACK);
+      set_bit(7, flags & START);
+      set_bit(8, flags & HOME);
+      set_bit(9, flags & LEFT_STICK);
+      set_bit(10, flags & RIGHT_STICK);
+      set_bit(11, flags & TOUCHPAD_BUTTON);
+      set_bit(12, flags & MISC_BUTTON);
+      set_bit(13, flags & PADDLE1);
+      set_bit(14, flags & PADDLE2);
+      set_bit(15, flags & PADDLE3);
+
+      return buttons;
+    }
+
+    std::uint8_t hat_from_flags(std::uint32_t flags) {
+      const bool up = flags & DPAD_UP;
+      const bool down = flags & DPAD_DOWN;
+      const bool left = flags & DPAD_LEFT;
+      const bool right = flags & DPAD_RIGHT;
+
+      if (up && right) {
+        return 1;
+      }
+      if (up && left) {
+        return 7;
+      }
+      if (down && right) {
+        return 3;
+      }
+      if (down && left) {
+        return 5;
+      }
+      if (up) {
+        return 0;
+      }
+      if (right) {
+        return 2;
+      }
+      if (down) {
+        return 4;
+      }
+      if (left) {
+        return 6;
+      }
+
+      return HAT_NEUTRAL;
+    }
+  }  // namespace
+
+  struct macos_gamepad_t {
+    IOHIDUserDeviceRef device {};
+    feedback_queue_t feedback_queue;
+    gamepad_id_t id {};
+    std::array<std::uint8_t, GAMEPAD_REPORT_SIZE> report = neutral_report();
+
+    ~macos_gamepad_t() {
+      if (device) {
+        CFRelease(device);
+      }
+    }
+  };
+
   struct macos_input_t {
   public:
     CGDirectDisplayID display {};
@@ -43,7 +150,110 @@ namespace platf {
     CGEventRef mouse_event {};  // mouse event source
     bool mouse_down[3] {};  // mouse button status
     std::chrono::steady_clock::steady_clock::time_point last_mouse_event[3][2];  // timestamp of last mouse events
+
+    std::array<std::unique_ptr<macos_gamepad_t>, MAX_GAMEPADS> gamepads {};
+    bool hid_user_device_checked {};
+    bool hid_user_device_supported {};
   };
+
+  namespace {
+    CFMutableDictionaryRef create_device_properties(const std::string &serial) {
+      auto properties = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      if (!properties) {
+        return nullptr;
+      }
+
+      const auto set_int = [&](CFStringRef key, int value) {
+        auto number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
+        if (number) {
+          CFDictionarySetValue(properties, key, number);
+          CFRelease(number);
+        }
+      };
+
+      set_int(kIOHIDVendorIDKey, 0x054C);
+      set_int(kIOHIDProductIDKey, 0x05C4);
+      set_int(kIOHIDVersionNumberKey, 0x0001);
+      set_int(kIOHIDPrimaryUsagePageKey, kHIDPage_GenericDesktop);
+      set_int(kIOHIDPrimaryUsageKey, kHIDUsage_GD_GamePad);
+
+      CFDictionarySetValue(properties, kIOHIDManufacturerKey, CFSTR("Sunshine"));
+      CFDictionarySetValue(properties, kIOHIDProductKey, CFSTR("Sunshine Virtual Gamepad"));
+
+      if (!serial.empty()) {
+        auto serial_cf = CFStringCreateWithCString(kCFAllocatorDefault, serial.c_str(), kCFStringEncodingUTF8);
+        if (serial_cf) {
+          CFDictionarySetValue(properties, kIOHIDSerialNumberKey, serial_cf);
+          CFRelease(serial_cf);
+        }
+      }
+
+      auto descriptor = CFDataCreate(kCFAllocatorDefault, GAMEPAD_REPORT_DESCRIPTOR.data(), GAMEPAD_REPORT_DESCRIPTOR.size());
+      if (descriptor) {
+        CFDictionarySetValue(properties, kIOHIDReportDescriptorKey, descriptor);
+        CFRelease(descriptor);
+      }
+
+      return properties;
+    }
+
+    bool ensure_virtual_gamepad_support(macos_input_t &input) {
+      if (input.hid_user_device_checked) {
+        return input.hid_user_device_supported;
+      }
+
+      input.hid_user_device_checked = true;
+      auto props = create_device_properties("sunshine-probe");
+      if (!props) {
+        input.hid_user_device_supported = false;
+        return false;
+      }
+
+      auto device = IOHIDUserDeviceCreate(kCFAllocatorDefault, props);
+      CFRelease(props);
+
+      if (!device) {
+        BOOST_LOG(error) << "Unable to create IOHIDUserDevice for Sunshine gamepad"sv;
+        input.hid_user_device_supported = false;
+        return false;
+      }
+
+      CFRelease(device);
+      input.hid_user_device_supported = true;
+      return true;
+    }
+
+    macos_gamepad_t *get_gamepad(macos_input_t &input, int index) {
+      if (index < 0 || index >= static_cast<int>(input.gamepads.size())) {
+        return nullptr;
+      }
+      return input.gamepads[index].get();
+    }
+
+    void submit_report(macos_gamepad_t &gamepad) {
+      if (!gamepad.device) {
+        return;
+      }
+
+      auto status = IOHIDUserDeviceHandleReport(gamepad.device, gamepad.report.data(), gamepad.report.size());
+      if (status != kIOReturnSuccess) {
+        BOOST_LOG(warning) << "Failed to submit HID report ["sv << util::hex(static_cast<std::uint32_t>(status)).to_string_view() << ']';
+      }
+    }
+
+    void populate_report_from_state(macos_gamepad_t &gamepad, const gamepad_state_t &state) {
+      const auto buttons = buttons_from_flags(state.buttonFlags);
+      gamepad.report[0] = static_cast<std::uint8_t>(buttons & 0xFF);
+      gamepad.report[1] = static_cast<std::uint8_t>((buttons >> 8) & 0xFF);
+      gamepad.report[2] = hat_from_flags(state.buttonFlags);
+      gamepad.report[3] = axis_from_int16(state.lsX);
+      gamepad.report[4] = axis_from_int16(state.lsY);
+      gamepad.report[5] = axis_from_int16(state.rsX);
+      gamepad.report[6] = axis_from_int16(state.rsY);
+      gamepad.report[7] = state.lt;
+      gamepad.report[8] = state.rt;
+    }
+  }  // namespace
 
   // A struct to hold a Windows keycode to Mac virtual keycode mapping.
   struct KeyCodeMap {
@@ -298,17 +508,82 @@ const KeyCodeMap kKeyCodesMap[] = {
     BOOST_LOG(info) << "unicode: Unicode input not yet implemented for MacOS."sv;
   }
 
-  int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
-    BOOST_LOG(info) << "alloc_gamepad: Gamepad not yet implemented for MacOS."sv;
-    return -1;
+  int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &, feedback_queue_t feedback_queue) {
+    auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (!macos_input) {
+      return -1;
+    }
+
+    if (!ensure_virtual_gamepad_support(*macos_input)) {
+      BOOST_LOG(error) << "alloc_gamepad: IOHID virtual devices are unavailable on this system"sv;
+      return -1;
+    }
+
+    if (id.globalIndex < 0 || id.globalIndex >= static_cast<int>(macos_input->gamepads.size())) {
+      BOOST_LOG(warning) << "alloc_gamepad: Invalid index ["sv << id.globalIndex << ']';
+      return -1;
+    }
+
+    auto &slot = macos_input->gamepads[id.globalIndex];
+    if (slot) {
+      BOOST_LOG(warning) << "alloc_gamepad: slot already in use ["sv << id.globalIndex << ']';
+      return -1;
+    }
+
+    auto serial = "sunshine-gp-"s + std::to_string(id.globalIndex);
+    auto props = create_device_properties(serial);
+    if (!props) {
+      BOOST_LOG(error) << "alloc_gamepad: Failed to build device properties"sv;
+      return -1;
+    }
+
+    auto device = IOHIDUserDeviceCreate(kCFAllocatorDefault, props);
+    CFRelease(props);
+    if (!device) {
+      BOOST_LOG(error) << "alloc_gamepad: IOHIDUserDeviceCreate failed"sv;
+      return -1;
+    }
+
+    slot = std::make_unique<macos_gamepad_t>();
+    slot->device = device;
+    slot->feedback_queue = std::move(feedback_queue);
+    slot->id = id;
+    slot->report = neutral_report();
+    submit_report(*slot);
+
+    BOOST_LOG(info) << "Allocated Sunshine virtual gamepad slot ["sv << id.globalIndex << ']';
+    return 0;
   }
 
   void free_gamepad(input_t &input, int nr) {
-    BOOST_LOG(info) << "free_gamepad: Gamepad not yet implemented for MacOS."sv;
+    auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (!macos_input || nr < 0 || nr >= static_cast<int>(macos_input->gamepads.size())) {
+      return;
+    }
+
+    auto &slot = macos_input->gamepads[nr];
+    if (!slot) {
+      return;
+    }
+
+    slot->report = neutral_report();
+    submit_report(*slot);
+    slot.reset();
   }
 
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
-    BOOST_LOG(info) << "gamepad: Gamepad not yet implemented for MacOS."sv;
+    auto macos_input = static_cast<macos_input_t *>(input.get());
+    if (!macos_input) {
+      return;
+    }
+
+    auto slot = get_gamepad(*macos_input, nr);
+    if (!slot) {
+      return;
+    }
+
+    populate_report_from_state(*slot, gamepad_state);
+    submit_report(*slot);
   }
 
   // returns current mouse location:
@@ -578,11 +853,33 @@ const KeyCodeMap kKeyCodesMap[] = {
   }
 
   std::vector<supported_gamepad_t> &supported_gamepads(input_t *input) {
-    static std::vector gamepads {
-      supported_gamepad_t {"", false, "gamepads.macos_not_implemented"}
+    if (!input) {
+      static std::vector defaults {
+        supported_gamepad_t {"auto", true, ""},
+        supported_gamepad_t {"hid", true, ""}
+      };
+      return defaults;
+    }
+
+    auto macos_input = static_cast<macos_input_t *>(input);
+    const bool supported = ensure_virtual_gamepad_support(*macos_input);
+    static std::vector availability {
+      supported_gamepad_t {"auto", true, ""},
+      supported_gamepad_t {"hid", false, "gamepads.macos_hid_unavailable"}
     };
 
-    return gamepads;
+    for (auto &entry : availability) {
+      if (entry.name == "hid") {
+        entry.is_enabled = supported;
+        entry.reason_disabled = supported ? "" : "gamepads.macos_hid_unavailable";
+      }
+    }
+
+    if (!supported) {
+      BOOST_LOG(warning) << "macOS virtual gamepad backend unavailable"sv;
+    }
+
+    return availability;
   }
 
   /**
